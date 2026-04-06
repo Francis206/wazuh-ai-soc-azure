@@ -1,5 +1,4 @@
 # wazuh-ai-soc-azure
-# wazuh-ai-soc-azure
 
 Open-source AI-augmented Security Operations Center on Azure — replacing 
 Tier 1–3 analyst functions with fine-tuned LLMs, at SMB-accessible cost.
