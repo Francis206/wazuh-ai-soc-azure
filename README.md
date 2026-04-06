@@ -1,0 +1,1 @@
+# wazuh-ai-soc-azure
