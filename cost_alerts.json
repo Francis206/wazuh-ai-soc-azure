@@ -1,0 +1,113 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "actionGroupEmail": {
+      "type": "string",
+      "metadata": { "description": "Email address for all SOC cost and compliance alerts" }
+    },
+    "env": { "type": "string", "defaultValue": "prod" }
+  },
+  "resources": [
+    {
+      "comments": "Alert 1: GPU spot cluster active outside 00:00-06:00 UTC training window. Indicates a runaway job. Uses AmlComputeClusterEvent (correct table) with datetime_part() (valid KQL function). NodeCount > 0 was incorrect — TargetNodeCount is the right field.",
+      "type": "microsoft.insights/scheduledqueryrules",
+      "apiVersion": "2023-03-15",
+      "name": "[concat('alert-gpu-runaway-', parameters('env'))]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "displayName": "GPU spot cluster active outside training window",
+        "severity": 2,
+        "enabled": true,
+        "evaluationFrequency": "PT30M",
+        "windowSize": "PT1H",
+        "criteria": {
+          "allOf": [{
+            "query": "AmlComputeClusterEvent | where ClusterName contains 'gpu-spot' | where TargetNodeCount > 0 | where datetime_part('Hour', TimeGenerated) !between (0 .. 6)",
+            "timeAggregation": "Count",
+            "operator": "GreaterThan",
+            "threshold": 2
+          }]
+        },
+        "actions": {
+          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+        }
+      }
+    },
+    {
+      "comments": "Alert 2: APIM AI call volume exceeds 500k/hour. Indicates prompt injection loop or misconfigured client. Metric is ai_call_count (renamed from ai_token_usage — value=1 per call, not actual token count).",
+      "type": "microsoft.insights/scheduledqueryrules",
+      "apiVersion": "2023-03-15",
+      "name": "[concat('alert-apim-call-spike-', parameters('env'))]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "displayName": "APIM AI call volume spike > 500k per hour",
+        "severity": 2,
+        "enabled": true,
+        "evaluationFrequency": "PT15M",
+        "windowSize": "PT1H",
+        "criteria": {
+          "allOf": [{
+            "query": "customMetrics | where name == 'ai_call_count' | summarize Total=sum(value) by bin(timestamp, 1h)",
+            "timeAggregation": "Total",
+            "operator": "GreaterThan",
+            "threshold": 500000
+          }]
+        },
+        "actions": {
+          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+        }
+      }
+    },
+    {
+      "comments": "Alert 3: HIPAA CRITICAL — PHI sanitization bypass detected at APIM gateway. Severity 0 = immediate page. Queries ApiManagementGatewayLogs for HTTP 400 responses matching the PHI check-header policy error message.",
+      "type": "microsoft.insights/scheduledqueryrules",
+      "apiVersion": "2023-03-15",
+      "name": "[concat('alert-phi-bypass-', parameters('env'))]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "displayName": "HIPAA CRITICAL — PHI sanitization bypass detected",
+        "severity": 0,
+        "enabled": true,
+        "evaluationFrequency": "PT5M",
+        "windowSize": "PT5M",
+        "criteria": {
+          "allOf": [{
+            "query": "ApiManagementGatewayLogs | where ResponseCode == 400 | where Message contains 'PHI-sanitized'",
+            "timeAggregation": "Count",
+            "operator": "GreaterThan",
+            "threshold": 0
+          }]
+        },
+        "actions": {
+          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+        }
+      }
+    },
+    {
+      "comments": "Alert 4: Wazuh AKS cluster node count below minimum. Uses KubeNodeInventory (correct table for AKS node health) instead of AzureDiagnostics kube-audit, which does not expose node counts. Fires if ready nodes < 2 (below minimum for HA).",
+      "type": "microsoft.insights/scheduledqueryrules",
+      "apiVersion": "2023-03-15",
+      "name": "[concat('alert-wazuh-offline-', parameters('env'))]",
+      "location": "[resourceGroup().location]",
+      "properties": {
+        "displayName": "Wazuh AKS node count below minimum",
+        "severity": 1,
+        "enabled": true,
+        "evaluationFrequency": "PT5M",
+        "windowSize": "PT10M",
+        "criteria": {
+          "allOf": [{
+            "query": "KubeNodeInventory | where ClusterName contains 'aks-wazuh' | where Status == 'Ready' | summarize NodeCount=count() by bin(TimeGenerated, 5m) | where NodeCount < 2",
+            "timeAggregation": "Count",
+            "operator": "GreaterThan",
+            "threshold": 0
+          }]
+        },
+        "actions": {
+          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+        }
+      }
+    }
+  ]
+}

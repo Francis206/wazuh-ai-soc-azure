@@ -1,0 +1,130 @@
+<!--
+  APIM inbound/outbound policy for the SOC AI gateway.
+  Apply at the API level: APIM > APIs > SOC AI API > All Operations > Edit policy.
+
+  Corrections vs initial version:
+    - <retry><forward-request/></retry> moved to <backend> (was incorrectly in <inbound>)
+    - set-variable inner string literals use &quot; escaping for XML well-formedness
+    - emit-metric renamed ai_call_count (value=1 counts calls, not LLM token consumption)
+-->
+<policies>
+  <inbound>
+    <base/>
+
+    <!-- 1. Validate Azure AD JWT -->
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized - valid Azure AD JWT required">
+      <openid-config url="https://login.microsoftonline.com/{TENANT_ID}/v2.0/.well-known/openid-configuration"/>
+      <audiences>
+        <audience>api://soc-ai-gateway</audience>
+      </audiences>
+      <required-claims>
+        <claim name="roles" match="any">
+          <value>SOC.Tier1</value>
+          <value>SOC.Tier2</value>
+          <value>SOC.Tier3</value>
+          <value>SOC.Admin</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+
+    <!-- 2. HIPAA guard - reject requests missing PHI sanitization header -->
+    <check-header name="X-PHI-Sanitized"
+                  failed-check-httpcode="400"
+                  failed-check-error-message="HIPAA: request must be PHI-sanitized before reaching AI gateway"
+                  ignore-case="true">
+      <value>true</value>
+    </check-header>
+
+    <!-- 3. Stamp audit correlation ID -->
+    <set-header name="X-SOC-Request-Id" exists-action="override">
+      <value>@(Guid.NewGuid().ToString())</value>
+    </set-header>
+
+    <!-- 4. Read tier header - inner quotes escaped as &quot; for XML validity -->
+    <set-variable name="caller_tier"
+                  value="@(context.Request.Headers.GetValueOrDefault(&quot;X-SOC-Tier&quot;, &quot;tier1&quot;).ToLower())"/>
+
+    <!-- 5. Route to correct backend with per-tier rate limiting -->
+    <choose>
+      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier1&quot;)">
+        <rate-limit-by-key calls="1000" renewal-period="60"
+                           counter-key="@(context.Request.IpAddress)"
+                           increment-condition="@(context.Response.StatusCode &lt; 500)"/>
+        <set-backend-service base-url="{{tier1-mistral-container-app-url}}"/>
+      </when>
+      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier2&quot;)">
+        <rate-limit-by-key calls="200" renewal-period="60"
+                           counter-key="@(context.Request.IpAddress)"/>
+        <set-backend-service base-url="{{tier2-rag-azure-ml-endpoint-url}}"/>
+      </when>
+      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier3&quot;)">
+        <rate-limit-by-key calls="50" renewal-period="60"
+                           counter-key="@(context.Request.IpAddress)"/>
+        <set-backend-service base-url="{{tier3-hunt-azure-ml-batch-url}}"/>
+      </when>
+      <otherwise>
+        <return-response>
+          <set-status code="400" reason="Unknown SOC tier"/>
+        </return-response>
+      </otherwise>
+    </choose>
+  </inbound>
+
+  <backend>
+    <!--
+      Circuit breaker with exponential backoff.
+      MUST be in <backend> - forward-request is invalid in <inbound>.
+      Retries on HTTP 5xx up to 3 times: intervals ~2s, 8s, 30s (capped).
+    -->
+    <retry condition="@(context.Response.StatusCode >= 500)"
+           count="3" interval="2" max-interval="30" delta="2" first-fast-retry="true">
+      <forward-request timeout="30"/>
+    </retry>
+  </backend>
+
+  <outbound>
+    <base/>
+
+    <!--
+      Emit per-call count to Azure Monitor.
+      Named ai_call_count because value=1 counts API invocations, NOT LLM token usage.
+      To meter actual tokens, parse the model response body for usage.completion_tokens
+      and emit as a separate metric with the token count as the value.
+    -->
+    <emit-metric name="ai_call_count" value="1" namespace="SOC-AI">
+      <dimension name="tier"  value="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;unknown&quot;))"/>
+      <dimension name="model" value="@(context.Response.Headers.GetValueOrDefault(&quot;X-Model-Name&quot;, &quot;unknown&quot;))"/>
+    </emit-metric>
+
+    <!-- Security and cache headers -->
+    <set-header name="Cache-Control"          exists-action="override"><value>no-store, no-cache, must-revalidate</value></set-header>
+    <set-header name="X-Content-Type-Options" exists-action="override"><value>nosniff</value></set-header>
+    <set-header name="X-Frame-Options"        exists-action="override"><value>DENY</value></set-header>
+
+    <!-- HIPAA audit ID on every response -->
+    <set-header name="X-HIPAA-Audit-Id" exists-action="override">
+      <value>@(context.Variables.GetValueOrDefault(&quot;X-SOC-Request-Id&quot;, &quot;&quot;))</value>
+    </set-header>
+  </outbound>
+
+  <on-error>
+    <base/>
+    <log-to-eventhub logger-id="soc-audit-logger" partition-id="0">
+      @{
+        return new JObject(
+          new JProperty("requestId",    context.Variables["X-SOC-Request-Id"]),
+          new JProperty("tier",         context.Variables["caller_tier"]),
+          new JProperty("errorSource",  context.LastError.Source),
+          new JProperty("errorReason",  context.LastError.Reason),
+          new JProperty("errorMessage", context.LastError.Message),
+          new JProperty("timestamp",    DateTime.UtcNow.ToString("o"))
+        ).ToString();
+      }
+    </log-to-eventhub>
+    <return-response>
+      <set-status code="@(context.Response.StatusCode)" reason="@(context.Response.StatusReason)"/>
+    </return-response>
+  </on-error>
+</policies>
