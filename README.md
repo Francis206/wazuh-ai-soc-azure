@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # Open-Source AI-Augmented SOC on Azure
 
 Automating Tier 1–3 SOC operations by pairing **Wazuh** (open-source SIEM/XDR)
