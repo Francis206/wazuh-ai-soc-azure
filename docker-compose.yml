@@ -1,0 +1,122 @@
+version: "3.8"
+
+# Wazuh single-node stack for local development. Production deployment
+# (Azure VM/AKS) is provisioned via infra/modules/wazuh_compute instead —
+# see docs/deployment.md.
+
+x-wazuh-image-version: &wazuh-version "4.9.2"
+
+services:
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.9.2
+    hostname: wazuh.manager
+    restart: unless-stopped
+    ports:
+      - "1514:1514"       # agent event data
+      - "1515:1515"       # agent enrollment
+      - "514:514/udp"     # syslog
+      - "55000:55000"     # Wazuh API
+    environment:
+      - INDEXER_URL=https://wazuh.indexer:9200
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USER:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-change-me}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - ./wazuh/rules:/var/ossec/etc/rules/custom:ro
+      - ./wazuh/decoders:/var/ossec/etc/decoders/custom:ro
+      - ./wazuh/integrations/ml_pipeline_integration.py:/var/ossec/integrations/custom-ml-pipeline:ro
+    networks:
+      - soc-net
+
+  wazuh.indexer:
+    image: wazuh/wazuh-indexer:4.9.2
+    hostname: wazuh.indexer
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+    networks:
+      - soc-net
+
+  wazuh.dashboard:
+    image: wazuh/wazuh-dashboard:4.9.2
+    hostname: wazuh.dashboard
+    restart: unless-stopped
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USER:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-change-me}
+      - WAZUH_API_URL=https://wazuh.manager
+      - DASHBOARD_USERNAME=${WAZUH_DASHBOARD_USER:-kibanaserver}
+      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD:-change-me}
+    depends_on:
+      - wazuh.indexer
+      - wazuh.manager
+    networks:
+      - soc-net
+
+  ml-inference:
+    build:
+      context: .
+      dockerfile: docker/ml-service/Dockerfile
+    hostname: ml-inference
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ml/models:/app/ml/models:ro
+    networks:
+      - soc-net
+
+  soc-api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    hostname: soc-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - LLM_INFERENCE_URL=http://ml-inference:8001
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ml-inference
+    networks:
+      - soc-net
+
+networks:
+  soc-net:
+    driver: bridge
+
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  wazuh-indexer-data:

@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+!docker/wazuh/config/**/*.example
+
+# Terraform
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.backup
+infra/**/.terraform.lock.hcl
+infra/**/*.tfvars
+!infra/environments/*.tfvars.example
+crash.log
+
+# ML artifacts
+ml/data/*
+!ml/data/.gitkeep
+ml/models/*
+!ml/models/.gitkeep
+*.pt
+*.bin
+*.safetensors
+wandb/
+mlruns/
+
+# Wazuh runtime state
+docker/wazuh/config/wazuh_indexer_ssl_certs/
+docker/wazuh/config/wazuh_cluster/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Node (docs site, if any)
+node_modules/
