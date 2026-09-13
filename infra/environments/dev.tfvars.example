@@ -1,0 +1,6 @@
+# Copy to dev.tfvars (gitignored) and fill in before running `make infra-plan`.
+azure_subscription_id = "00000000-0000-0000-0000-000000000000"
+environment           = "dev"
+location              = "eastus"
+project_name          = "soc-ai"
+wazuh_ssh_public_key  = "ssh-ed25519 AAAA... your-key-here"

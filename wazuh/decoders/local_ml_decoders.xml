@@ -1,0 +1,13 @@
+<!--
+  Placeholder decoders for log sources feeding the AI-augmented SOC
+  pipeline that aren't covered by Wazuh's ruleset out of the box.
+  Add one <decoder> block per custom log source as agents are onboarded.
+-->
+<decoder name="ml-pipeline-app">
+  <program_name>^ml-pipeline</program_name>
+</decoder>
+
+<decoder name="ml-pipeline-app-json">
+  <parent>ml-pipeline-app</parent>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>

@@ -1,0 +1,6 @@
+# Copy to dev.backend.hcl (gitignored) — remote state storage, created once
+# out-of-band (it can't provision the backend that stores its own state).
+resource_group_name  = "rg-tfstate"
+storage_account_name = "sttfstatesocai"
+container_name       = "tfstate"
+key                  = "soc-ai-dev.tfstate"

@@ -1,0 +1,12 @@
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+
+runcmd:
+  - systemctl enable --now docker
+  - git clone ${repo_url} /opt/soc-ai
+  - cd /opt/soc-ai && cp .env.example .env
+  - cd /opt/soc-ai && docker compose up -d wazuh.manager wazuh.indexer wazuh.dashboard

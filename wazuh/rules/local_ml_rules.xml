@@ -1,0 +1,41 @@
+<!--
+  Custom rules that mark which alerts are eligible for LLM-based triage.
+  Loaded into Wazuh manager at /var/ossec/etc/rules/custom/.
+  Rule IDs 100000-100099 are reserved for this project (avoids collision
+  with Wazuh's own rule ID ranges and any other custom rule sets).
+-->
+<group name="local,ml_pipeline,">
+
+  <!-- Tag every alert at or above the "notice" level so the ingestion
+       listener only forwards actionable events to the LLM pipeline. -->
+  <rule id="100000" level="0">
+    <if_group>syslog|sshd|web|firewall|windows</if_group>
+    <description>Base group for ML-pipeline-eligible events</description>
+  </rule>
+
+  <rule id="100010" level="10">
+    <if_sid>100000</if_sid>
+    <field name="ml_pipeline_eligible">true</field>
+    <options>no_full_log</options>
+    <description>Event flagged for AI-augmented SOC triage (Tier 1)</description>
+    <group>ml_pipeline_tier1,</group>
+  </rule>
+
+  <!-- Escalation: repeated high-severity events from the same source
+       within a short window are routed straight to Tier 2 correlation. -->
+  <rule id="100020" level="12" frequency="5" timeframe="300">
+    <if_matched_sid>100010</if_matched_sid>
+    <same_source_ip />
+    <description>Repeated high-severity events from same source: escalate to Tier 2</description>
+    <group>ml_pipeline_tier2,</group>
+  </rule>
+
+  <!-- Critical: correlated multi-host activity, candidate for automated
+       Tier 3 containment (subject to the orchestrator's confidence gate). -->
+  <rule id="100030" level="15">
+    <if_matched_sid>100020</if_matched_sid>
+    <description>Correlated multi-stage activity: candidate for automated Tier 3 response</description>
+    <group>ml_pipeline_tier3,</group>
+  </rule>
+
+</group>
