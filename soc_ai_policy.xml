@@ -1,21 +1,65 @@
 <!--
-  APIM inbound/outbound policy for the SOC AI gateway.
-  Apply at the API level: APIM > APIs > SOC AI API > All Operations > Edit policy.
+  APIM policy for the SOC AI gateway — corrected.
 
-  Corrections vs initial version:
-    - <retry><forward-request/></retry> moved to <backend> (was incorrectly in <inbound>)
-    - set-variable inner string literals use &quot; escaping for XML well-formedness
-    - emit-metric renamed ai_call_count (value=1 counts calls, not LLM token consumption)
+  CHANGES vs the committed version, in order of importance:
+
+  1. PRIVILEGE ESCALATION (report P1-1). The old policy validated that the
+     caller held one of SOC.Tier1/2/3/Admin, then routed on the caller-supplied
+     X-SOC-Tier header. A SOC.Tier1 principal could reach the Tier 3 backend by
+     changing a header. Tier is now derived from the validated `roles` claim.
+     X-SOC-Tier survives only as a voluntary DOWNGRADE request, intersected
+     with what the claim actually grants.
+
+  2. BROKEN AUDIT TRAIL (report P2-1). X-SOC-Request-Id was written as a
+     *header* and read back as a *variable*. X-HIPAA-Audit-Id was therefore
+     always empty, and context.Variables["X-SOC-Request-Id"] in <on-error>
+     threw KeyNotFoundException — the error handler failed exactly when the
+     audit record mattered. Now a real variable, read with GetValueOrDefault
+     everywhere.
+
+  3. RUNTIME EXCEPTION (report P2-2). increment-condition referenced
+     context.Response inside <inbound>, where it is null. Removed.
+
+  4. RATE-LIMIT KEY (report P3-7). counter-key was context.Request.IpAddress.
+     Every alert arrives from one Wazuh manager, so the whole SOC shared one
+     bucket. Now keyed on the JWT subject.
+
+  5. NO ABSOLUTE CEILING (report P3-8). Rate limits alone let a runaway loop
+     burn 1.44M calls/day. Added quota-by-key as a hard daily cap.
+
+  6. NAMING (report P2-3). <retry> is not a circuit breaker. Renamed and
+     restricted to idempotent-safe conditions. A real circuit breaker is
+     configured on the APIM *backend entity*, not in policy — see the note
+     in <backend>.
+
+  7. {TENANT_ID} was a literal placeholder. Now the {{aad-tenant-id}} named
+     value created in main.tf.
+
+  PREREQUISITES (created by patches/main.tf):
+    named values: aad-tenant-id, tier1-mistral-container-app-url,
+                  tier2-rag-azure-ml-endpoint-url, tier3-hunt-azure-ml-batch-url
+    An azurerm_api_management_api + azurerm_api_management_api_policy to
+    attach this to. The committed repo had neither, so the XML had nothing
+    to bind to.
+
+  STILL NOT SOLVED HERE: X-PHI-Sanitized remains caller-asserted. A header
+  the client can simply type is not a boundary. See patches/src_common_phi.py
+  for the HMAC attestation that makes this check meaningful, and swap the
+  <check-header> below for the <validate-hmac> pattern described there once
+  the sanitizer is emitting attestations.
 -->
 <policies>
   <inbound>
     <base/>
 
-    <!-- 1. Validate Azure AD JWT -->
+    <!-- 1. Validate Entra ID JWT. output-token-variable-name is new: it is
+            what lets later policies read the claims instead of trusting
+            headers. -->
     <validate-jwt header-name="Authorization"
                   failed-validation-httpcode="401"
-                  failed-validation-error-message="Unauthorized - valid Azure AD JWT required">
-      <openid-config url="https://login.microsoftonline.com/{TENANT_ID}/v2.0/.well-known/openid-configuration"/>
+                  failed-validation-error-message="Unauthorized - valid Entra ID JWT required"
+                  output-token-variable-name="jwt">
+      <openid-config url="https://login.microsoftonline.com/{{aad-tenant-id}}/v2.0/.well-known/openid-configuration"/>
       <audiences>
         <audience>api://soc-ai-gateway</audience>
       </audiences>
@@ -29,7 +73,8 @@
       </required-claims>
     </validate-jwt>
 
-    <!-- 2. HIPAA guard - reject requests missing PHI sanitization header -->
+    <!-- 2. HIPAA guard. See the header note: this is currently an assertion,
+            not a proof. -->
     <check-header name="X-PHI-Sanitized"
                   failed-check-httpcode="400"
                   failed-check-error-message="HIPAA: request must be PHI-sanitized before reaching AI gateway"
@@ -37,36 +82,85 @@
       <value>true</value>
     </check-header>
 
-    <!-- 3. Stamp audit correlation ID -->
+    <!-- 3. Audit correlation ID as a VARIABLE first, then echoed as a header.
+            The old policy only set the header, which is why every downstream
+            read of it came back empty. -->
+    <set-variable name="soc_request_id" value="@(Guid.NewGuid().ToString())"/>
     <set-header name="X-SOC-Request-Id" exists-action="override">
-      <value>@(Guid.NewGuid().ToString())</value>
+      <value>@((string)context.Variables["soc_request_id"])</value>
     </set-header>
 
-    <!-- 4. Read tier header - inner quotes escaped as &quot; for XML validity -->
-    <set-variable name="caller_tier"
-                  value="@(context.Request.Headers.GetValueOrDefault(&quot;X-SOC-Tier&quot;, &quot;tier1&quot;).ToLower())"/>
+    <!-- 4. Stable caller identity for rate limiting and quota, from the token
+            rather than the source IP. -->
+    <set-variable name="caller_id" value="@{
+      var jwt = (Jwt)context.Variables[&quot;jwt&quot;];
+      var sub = jwt.Subject;
+      if (!string.IsNullOrEmpty(sub)) { return sub; }
+      return jwt.Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;);
+    }"/>
 
-    <!-- 5. Route to correct backend with per-tier rate limiting -->
+    <!-- 5. THE FIX. Tier comes from the role claim we just validated.
+            X-SOC-Tier may only request a tier at or below what the claim
+            grants; anything above returns "denied" and is rejected by the
+            <otherwise> branch. -->
+    <set-variable name="caller_tier" value="@{
+      var jwt = (Jwt)context.Variables[&quot;jwt&quot;];
+      string[] roles = jwt.Claims.ContainsKey(&quot;roles&quot;)
+        ? jwt.Claims[&quot;roles&quot;]
+        : new string[0];
+
+      int granted = 0;
+      if (roles.Contains(&quot;SOC.Admin&quot;) || roles.Contains(&quot;SOC.Tier3&quot;)) { granted = 3; }
+      else if (roles.Contains(&quot;SOC.Tier2&quot;)) { granted = 2; }
+      else if (roles.Contains(&quot;SOC.Tier1&quot;)) { granted = 1; }
+      if (granted == 0) { return &quot;denied&quot;; }
+
+      string req = context.Request.Headers
+        .GetValueOrDefault(&quot;X-SOC-Tier&quot;, &quot;&quot;)
+        .ToLower();
+
+      int wanted = 0;
+      if (req == &quot;tier3&quot;) { wanted = 3; }
+      else if (req == &quot;tier2&quot;) { wanted = 2; }
+      else if (req == &quot;tier1&quot;) { wanted = 1; }
+
+      if (wanted == 0) { return &quot;tier&quot; + granted.ToString(); }
+      if (wanted &gt; granted) { return &quot;denied&quot;; }
+      return &quot;tier&quot; + wanted.ToString();
+    }"/>
+
+    <!-- 6. Hard daily ceiling. Rate limits bound the burst; this bounds the
+            bill. 1000/min sustained is 1.44M calls/day without it. -->
+    <quota-by-key calls="200000"
+                  renewal-period="86400"
+                  counter-key="@((string)context.Variables[&quot;caller_id&quot;])"/>
+
+    <!-- 7. Route + per-tier rate limit, keyed on caller not source IP. -->
     <choose>
-      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier1&quot;)">
+      <when condition="@((string)context.Variables[&quot;caller_tier&quot;] == &quot;tier1&quot;)">
         <rate-limit-by-key calls="1000" renewal-period="60"
-                           counter-key="@(context.Request.IpAddress)"
-                           increment-condition="@(context.Response.StatusCode &lt; 500)"/>
+                           counter-key="@((string)context.Variables[&quot;caller_id&quot;])"/>
         <set-backend-service base-url="{{tier1-mistral-container-app-url}}"/>
       </when>
-      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier2&quot;)">
+      <when condition="@((string)context.Variables[&quot;caller_tier&quot;] == &quot;tier2&quot;)">
         <rate-limit-by-key calls="200" renewal-period="60"
-                           counter-key="@(context.Request.IpAddress)"/>
+                           counter-key="@((string)context.Variables[&quot;caller_id&quot;])"/>
         <set-backend-service base-url="{{tier2-rag-azure-ml-endpoint-url}}"/>
       </when>
-      <when condition="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;&quot;) == &quot;tier3&quot;)">
+      <when condition="@((string)context.Variables[&quot;caller_tier&quot;] == &quot;tier3&quot;)">
         <rate-limit-by-key calls="50" renewal-period="60"
-                           counter-key="@(context.Request.IpAddress)"/>
+                           counter-key="@((string)context.Variables[&quot;caller_id&quot;])"/>
         <set-backend-service base-url="{{tier3-hunt-azure-ml-batch-url}}"/>
       </when>
       <otherwise>
+        <!-- 403, not 400: the caller authenticated fine, they asked for a
+             tier their role does not grant. That distinction is what makes
+             the escalation attempt visible in the gateway logs. -->
         <return-response>
-          <set-status code="400" reason="Unknown SOC tier"/>
+          <set-status code="403" reason="Requested SOC tier exceeds granted role"/>
+          <set-header name="X-SOC-Request-Id" exists-action="override">
+            <value>@((string)context.Variables["soc_request_id"])</value>
+          </set-header>
         </return-response>
       </otherwise>
     </choose>
@@ -74,57 +168,88 @@
 
   <backend>
     <!--
-      Circuit breaker with exponential backoff.
-      MUST be in <backend> - forward-request is invalid in <inbound>.
-      Retries on HTTP 5xx up to 3 times: intervals ~2s, 8s, 30s (capped).
+      Bounded retry on transient upstream failure. NOT a circuit breaker.
+
+      A real circuit breaker belongs on the APIM backend entity
+      (azurerm_api_management_backend -> circuit_breaker), which trips the
+      whole backend out of rotation. Retrying three times into a saturated
+      GPU endpoint, as the old policy did, is a retry storm.
+
+      Narrowed to 502/503/504 only. 500 is excluded because a model-server
+      500 is usually deterministic (bad prompt, OOM) and retrying it wastes
+      three GPU slots to fail three times. Note these are POSTs — confirm
+      your inference backend is idempotent before widening this.
     -->
-    <retry condition="@(context.Response.StatusCode >= 500)"
-           count="3" interval="2" max-interval="30" delta="2" first-fast-retry="true">
-      <forward-request timeout="30"/>
+    <retry condition="@(context.Response.StatusCode == 502 || context.Response.StatusCode == 503 || context.Response.StatusCode == 504)"
+           count="2"
+           interval="2"
+           max-interval="20"
+           delta="4"
+           first-fast-retry="false">
+      <forward-request timeout="60"/>
     </retry>
   </backend>
 
   <outbound>
     <base/>
 
-    <!--
-      Emit per-call count to Azure Monitor.
-      Named ai_call_count because value=1 counts API invocations, NOT LLM token usage.
-      To meter actual tokens, parse the model response body for usage.completion_tokens
-      and emit as a separate metric with the token count as the value.
-    -->
     <emit-metric name="ai_call_count" value="1" namespace="SOC-AI">
-      <dimension name="tier"  value="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;unknown&quot;))"/>
-      <dimension name="model" value="@(context.Response.Headers.GetValueOrDefault(&quot;X-Model-Name&quot;, &quot;unknown&quot;))"/>
+      <dimension name="tier"   value="@(context.Variables.GetValueOrDefault(&quot;caller_tier&quot;, &quot;unknown&quot;))"/>
+      <dimension name="model"  value="@(context.Response.Headers.GetValueOrDefault(&quot;X-Model-Name&quot;, &quot;unknown&quot;))"/>
+      <dimension name="status" value="@(context.Response.StatusCode.ToString())"/>
     </emit-metric>
 
-    <!-- Security and cache headers -->
-    <set-header name="Cache-Control"          exists-action="override"><value>no-store, no-cache, must-revalidate</value></set-header>
-    <set-header name="X-Content-Type-Options" exists-action="override"><value>nosniff</value></set-header>
-    <set-header name="X-Frame-Options"        exists-action="override"><value>DENY</value></set-header>
+    <set-header name="Cache-Control" exists-action="override">
+      <value>no-store, no-cache, must-revalidate</value>
+    </set-header>
+    <set-header name="X-Content-Type-Options" exists-action="override">
+      <value>nosniff</value>
+    </set-header>
+    <set-header name="X-Frame-Options" exists-action="override">
+      <value>DENY</value>
+    </set-header>
 
-    <!-- HIPAA audit ID on every response -->
+    <!-- Now actually populated. Previously always empty. -->
     <set-header name="X-HIPAA-Audit-Id" exists-action="override">
-      <value>@(context.Variables.GetValueOrDefault(&quot;X-SOC-Request-Id&quot;, &quot;&quot;))</value>
+      <value>@(context.Variables.GetValueOrDefault("soc_request_id", ""))</value>
     </set-header>
   </outbound>
 
   <on-error>
     <base/>
-    <log-to-eventhub logger-id="soc-audit-logger" partition-id="0">
+    <!--
+      GetValueOrDefault, not the indexer. context.Variables["X-SOC-Request-Id"]
+      threw KeyNotFoundException here, so the audit record was never written.
+
+      NOTE: log-to-eventhub needs an azurerm_api_management_logger named
+      "soc-audit-logger" and an Event Hub behind it. Neither exists in the
+      committed Terraform. Create both or this element is a no-op.
+      partition-id="0" also removed — pinning every audit record to one
+      partition caps throughput and buys nothing.
+    -->
+    <log-to-eventhub logger-id="soc-audit-logger">
       @{
         return new JObject(
-          new JProperty("requestId",    context.Variables["X-SOC-Request-Id"]),
-          new JProperty("tier",         context.Variables["caller_tier"]),
-          new JProperty("errorSource",  context.LastError.Source),
-          new JProperty("errorReason",  context.LastError.Reason),
-          new JProperty("errorMessage", context.LastError.Message),
+          new JProperty("requestId",    context.Variables.GetValueOrDefault("soc_request_id", "")),
+          new JProperty("callerId",     context.Variables.GetValueOrDefault("caller_id", "")),
+          new JProperty("tier",         context.Variables.GetValueOrDefault("caller_tier", "")),
+          new JProperty("operation",    context.Operation?.Name ?? ""),
+          new JProperty("errorSource",  context.LastError?.Source ?? ""),
+          new JProperty("errorReason",  context.LastError?.Reason ?? ""),
+          new JProperty("errorMessage", context.LastError?.Message ?? ""),
           new JProperty("timestamp",    DateTime.UtcNow.ToString("o"))
         ).ToString();
       }
     </log-to-eventhub>
+
+    <!-- The old handler read context.Response.StatusCode unguarded. If the
+         error occurred before any backend response, that is null. -->
     <return-response>
-      <set-status code="@(context.Response.StatusCode)" reason="@(context.Response.StatusReason)"/>
+      <set-status code="@(context.Response?.StatusCode ?? 500)"
+                  reason="@(context.Response?.StatusReason ?? &quot;Internal Server Error&quot;)"/>
+      <set-header name="X-HIPAA-Audit-Id" exists-action="override">
+        <value>@(context.Variables.GetValueOrDefault("soc_request_id", ""))</value>
+      </set-header>
     </return-response>
   </on-error>
 </policies>

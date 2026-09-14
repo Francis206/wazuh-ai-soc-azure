@@ -1,113 +1,282 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_comment": [
+      "CORRECTED. The committed template could not deploy. Changes:",
+      "",
+      "1. BLOCKER - every rule was missing the required 'scopes' property.",
+      "   scheduledQueryRules 2023-03-15 rejects the template without it.",
+      "",
+      "2. BLOCKER - all four rules referenced actionGroups 'ag-soc-<env>',",
+      "   which no template, and neither main.tf nor infra/, ever created.",
+      "   The action group is now created here as resource[0] and everything",
+      "   else dependsOn it. The actionGroupEmail parameter, previously",
+      "   declared and never used, now feeds it.",
+      "",
+      "3. BUG - alert 2 queried the Application Insights 'customMetrics'",
+      "   table. APIM emit-metric writes to Azure Monitor CUSTOM METRICS, a",
+      "   different store that is not queryable from Log Analytics KQL. The",
+      "   alert could never fire. Converted to a metricAlert against the",
+      "   SOC-AI/ai_call_count metric namespace, which is where the data is.",
+      "",
+      "4. SEMANTICS - alert 3 fired on HTTP 400 from the PHI check-header",
+      "   policy. That is the control WORKING, not a bypass. Paging at",
+      "   severity 0 because a client forgot a header is alert fatigue, and",
+      "   the real failure mode - PHI reaching the model WITH the header set",
+      "   true - was invisible. Now split into two rules: a sev-2 on blocked",
+      "   traffic (misconfigured client), and a sev-0 on sanitizer failure",
+      "   emitted by the application itself, which is the only place a true",
+      "   bypass is observable.",
+      "",
+      "5. MISMATCH - alert 4 queried KubeNodeInventory for 'aks-wazuh'.",
+      "   infra/ deploys Wazuh on a VM; only main.tf creates AKS. Now",
+      "   parameterised by wazuhComputeMode so one template serves both.",
+      "",
+      "6. Added metricMeasureColumn on the rules whose queries summarize into",
+      "   a named column while declaring a non-Count aggregation. Without it",
+      "   ARM rejects the criteria.",
+      "",
+      "7. Added autoMitigate so resolved conditions clear themselves."
+    ]
+  },
   "parameters": {
     "actionGroupEmail": {
       "type": "string",
       "metadata": { "description": "Email address for all SOC cost and compliance alerts" }
     },
-    "env": { "type": "string", "defaultValue": "prod" }
+    "env": {
+      "type": "string",
+      "defaultValue": "prod"
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "metadata": { "description": "Full resource ID of the Log Analytics workspace. Required scope for every scheduled query rule." }
+    },
+    "apimResourceId": {
+      "type": "string",
+      "metadata": { "description": "Full resource ID of the APIM instance. Scope for the ai_call_count metric alert." }
+    },
+    "wazuhComputeMode": {
+      "type": "string",
+      "defaultValue": "vm",
+      "allowedValues": [ "vm", "aks" ],
+      "metadata": { "description": "'vm' matches infra/modules/wazuh_compute. 'aks' matches main.tf." }
+    },
+    "minWazuhNodes": {
+      "type": "int",
+      "defaultValue": 2
+    }
+  },
+  "variables": {
+    "actionGroupName": "[concat('ag-soc-', parameters('env'))]",
+    "actionGroupId": "[resourceId('microsoft.insights/actionGroups', variables('actionGroupName'))]",
+    "wazuhOfflineQuery": {
+      "vm": "Heartbeat | where Computer startswith 'vm-wazuh' | summarize LastSeen = max(TimeGenerated) by Computer | where LastSeen < ago(10m)",
+      "aks": "KubeNodeInventory | where ClusterName contains 'aks-wazuh' | where Status == 'Ready' | summarize NodeCount = dcount(Computer) by bin(TimeGenerated, 5m) | where NodeCount < 2"
+    }
   },
   "resources": [
     {
-      "comments": "Alert 1: GPU spot cluster active outside 00:00-06:00 UTC training window. Indicates a runaway job. Uses AmlComputeClusterEvent (correct table) with datetime_part() (valid KQL function). NodeCount > 0 was incorrect — TargetNodeCount is the right field.",
-      "type": "microsoft.insights/scheduledqueryrules",
+      "comments": "Action group. Previously referenced by all four rules and never created.",
+      "type": "microsoft.insights/actionGroups",
+      "apiVersion": "2023-01-01",
+      "name": "[variables('actionGroupName')]",
+      "location": "Global",
+      "properties": {
+        "groupShortName": "[substring(concat('soc', parameters('env')), 0, min(12, length(concat('soc', parameters('env')))))]",
+        "enabled": true,
+        "emailReceivers": [
+          {
+            "name": "socOncall",
+            "emailAddress": "[parameters('actionGroupEmail')]",
+            "useCommonAlertSchema": true
+          }
+        ]
+      }
+    },
+
+    {
+      "comments": "Alert 1: GPU spot cluster active outside the 00:00-06:00 UTC training window. NOTE: this definition pages on any legitimate daytime training run. If you train ad hoc, gate on cumulative node-hours per day instead of wall-clock hour.",
+      "type": "microsoft.insights/scheduledQueryRules",
       "apiVersion": "2023-03-15",
       "name": "[concat('alert-gpu-runaway-', parameters('env'))]",
       "location": "[resourceGroup().location]",
+      "dependsOn": [ "[variables('actionGroupId')]" ],
       "properties": {
         "displayName": "GPU spot cluster active outside training window",
         "severity": 2,
         "enabled": true,
+        "autoMitigate": true,
         "evaluationFrequency": "PT30M",
         "windowSize": "PT1H",
+        "scopes": [ "[parameters('logAnalyticsWorkspaceId')]" ],
         "criteria": {
-          "allOf": [{
-            "query": "AmlComputeClusterEvent | where ClusterName contains 'gpu-spot' | where TargetNodeCount > 0 | where datetime_part('Hour', TimeGenerated) !between (0 .. 6)",
-            "timeAggregation": "Count",
-            "operator": "GreaterThan",
-            "threshold": 2
-          }]
+          "allOf": [
+            {
+              "query": "AmlComputeClusterEvent | where ClusterName contains 'gpu-spot' | where TargetNodeCount > 0 | where datetime_part('Hour', TimeGenerated) !between (0 .. 6)",
+              "timeAggregation": "Count",
+              "operator": "GreaterThan",
+              "threshold": 2,
+              "failingPeriods": {
+                "numberOfEvaluationPeriods": 1,
+                "minFailingPeriodsToAlert": 1
+              }
+            }
+          ]
         },
         "actions": {
-          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+          "actionGroups": [ "[variables('actionGroupId')]" ]
         }
       }
     },
+
     {
-      "comments": "Alert 2: APIM AI call volume exceeds 500k/hour. Indicates prompt injection loop or misconfigured client. Metric is ai_call_count (renamed from ai_token_usage — value=1 per call, not actual token count).",
-      "type": "microsoft.insights/scheduledqueryrules",
-      "apiVersion": "2023-03-15",
+      "comments": "Alert 2: AI call volume spike. Converted from a scheduledQueryRule over customMetrics (wrong store - the data is never there) to a metricAlert over the SOC-AI custom metric namespace that APIM emit-metric actually writes to.",
+      "type": "microsoft.insights/metricAlerts",
+      "apiVersion": "2018-03-01",
       "name": "[concat('alert-apim-call-spike-', parameters('env'))]",
-      "location": "[resourceGroup().location]",
+      "location": "global",
+      "dependsOn": [ "[variables('actionGroupId')]" ],
       "properties": {
-        "displayName": "APIM AI call volume spike > 500k per hour",
+        "description": "APIM AI call volume exceeded 500k/hour - likely a runaway client loop or prompt-injection retry storm.",
         "severity": 2,
         "enabled": true,
+        "autoMitigate": true,
         "evaluationFrequency": "PT15M",
         "windowSize": "PT1H",
+        "scopes": [ "[parameters('apimResourceId')]" ],
         "criteria": {
-          "allOf": [{
-            "query": "customMetrics | where name == 'ai_call_count' | summarize Total=sum(value) by bin(timestamp, 1h)",
-            "timeAggregation": "Total",
-            "operator": "GreaterThan",
-            "threshold": 500000
-          }]
+          "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria",
+          "allOf": [
+            {
+              "name": "AiCallVolume",
+              "metricNamespace": "SOC-AI",
+              "metricName": "ai_call_count",
+              "operator": "GreaterThan",
+              "threshold": 500000,
+              "timeAggregation": "Total"
+            }
+          ]
+        },
+        "actions": [
+          { "actionGroupId": "[variables('actionGroupId')]" }
+        ]
+      }
+    },
+
+    {
+      "comments": "Alert 3a: the PHI header check is REJECTING traffic. This is the control working correctly against a misconfigured client - severity 2, not 0. The committed template paged at severity 0 for this.",
+      "type": "microsoft.insights/scheduledQueryRules",
+      "apiVersion": "2023-03-15",
+      "name": "[concat('alert-phi-header-rejects-', parameters('env'))]",
+      "location": "[resourceGroup().location]",
+      "dependsOn": [ "[variables('actionGroupId')]" ],
+      "properties": {
+        "displayName": "PHI sanitization header check is rejecting requests",
+        "description": "A caller is reaching the AI gateway without X-PHI-Sanitized. The control is holding, but a client is misconfigured and its alerts are not being triaged.",
+        "severity": 2,
+        "enabled": true,
+        "autoMitigate": true,
+        "evaluationFrequency": "PT15M",
+        "windowSize": "PT15M",
+        "scopes": [ "[parameters('logAnalyticsWorkspaceId')]" ],
+        "criteria": {
+          "allOf": [
+            {
+              "query": "ApiManagementGatewayLogs | where ResponseCode == 400 | where LastErrorMessage has 'PHI-sanitized'",
+              "timeAggregation": "Count",
+              "operator": "GreaterThan",
+              "threshold": 5,
+              "failingPeriods": {
+                "numberOfEvaluationPeriods": 1,
+                "minFailingPeriodsToAlert": 1
+              }
+            }
+          ]
         },
         "actions": {
-          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+          "actionGroups": [ "[variables('actionGroupId')]" ]
         }
       }
     },
+
     {
-      "comments": "Alert 3: HIPAA CRITICAL — PHI sanitization bypass detected at APIM gateway. Severity 0 = immediate page. Queries ApiManagementGatewayLogs for HTTP 400 responses matching the PHI check-header policy error message.",
-      "type": "microsoft.insights/scheduledqueryrules",
+      "comments": "Alert 3b: THE REAL SEVERITY-0. A genuine PHI bypass is unsanitized content reaching the model, which the gateway cannot see because the header is caller-asserted. It is only observable where sanitization runs. This queries the phi.sanitize_failed event emitted by src/common/phi.py (see patches/src_common_phi.py). Until that module is wired in, this rule has no data source - which is itself the finding.",
+      "type": "microsoft.insights/scheduledQueryRules",
       "apiVersion": "2023-03-15",
       "name": "[concat('alert-phi-bypass-', parameters('env'))]",
       "location": "[resourceGroup().location]",
+      "dependsOn": [ "[variables('actionGroupId')]" ],
       "properties": {
-        "displayName": "HIPAA CRITICAL — PHI sanitization bypass detected",
+        "displayName": "HIPAA CRITICAL - PHI sanitization failed open",
+        "description": "The sanitizer failed and an alert may have reached the model unsanitized. Investigate immediately and quarantine the affected model inputs.",
         "severity": 0,
         "enabled": true,
+        "autoMitigate": false,
         "evaluationFrequency": "PT5M",
         "windowSize": "PT5M",
+        "scopes": [ "[parameters('logAnalyticsWorkspaceId')]" ],
         "criteria": {
-          "allOf": [{
-            "query": "ApiManagementGatewayLogs | where ResponseCode == 400 | where Message contains 'PHI-sanitized'",
-            "timeAggregation": "Count",
-            "operator": "GreaterThan",
-            "threshold": 0
-          }]
+          "allOf": [
+            {
+              "query": "AppTraces | where Message has 'phi.sanitize_failed' or Message has 'phi.attestation_missing' | project TimeGenerated, Message, AppRoleName",
+              "timeAggregation": "Count",
+              "operator": "GreaterThan",
+              "threshold": 0,
+              "failingPeriods": {
+                "numberOfEvaluationPeriods": 1,
+                "minFailingPeriodsToAlert": 1
+              }
+            }
+          ]
         },
         "actions": {
-          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+          "actionGroups": [ "[variables('actionGroupId')]" ]
         }
       }
     },
+
     {
-      "comments": "Alert 4: Wazuh AKS cluster node count below minimum. Uses KubeNodeInventory (correct table for AKS node health) instead of AzureDiagnostics kube-audit, which does not expose node counts. Fires if ready nodes < 2 (below minimum for HA).",
-      "type": "microsoft.insights/scheduledqueryrules",
+      "comments": "Alert 4: Wazuh compute offline. Query switches on wazuhComputeMode because infra/ deploys a VM and main.tf deploys AKS - the committed template only handled AKS, which infra/ never creates.",
+      "type": "microsoft.insights/scheduledQueryRules",
       "apiVersion": "2023-03-15",
       "name": "[concat('alert-wazuh-offline-', parameters('env'))]",
       "location": "[resourceGroup().location]",
+      "dependsOn": [ "[variables('actionGroupId')]" ],
       "properties": {
-        "displayName": "Wazuh AKS node count below minimum",
+        "displayName": "Wazuh SIEM offline or below minimum capacity",
+        "description": "The SIEM is not reporting. Alert ingestion has stopped; the AI tiers have nothing to triage and the gap will not be visible anywhere else.",
         "severity": 1,
         "enabled": true,
+        "autoMitigate": true,
         "evaluationFrequency": "PT5M",
         "windowSize": "PT10M",
+        "scopes": [ "[parameters('logAnalyticsWorkspaceId')]" ],
         "criteria": {
-          "allOf": [{
-            "query": "KubeNodeInventory | where ClusterName contains 'aks-wazuh' | where Status == 'Ready' | summarize NodeCount=count() by bin(TimeGenerated, 5m) | where NodeCount < 2",
-            "timeAggregation": "Count",
-            "operator": "GreaterThan",
-            "threshold": 0
-          }]
+          "allOf": [
+            {
+              "query": "[variables('wazuhOfflineQuery')[parameters('wazuhComputeMode')]]",
+              "timeAggregation": "Count",
+              "operator": "GreaterThan",
+              "threshold": 0,
+              "failingPeriods": {
+                "numberOfEvaluationPeriods": 1,
+                "minFailingPeriodsToAlert": 1
+              }
+            }
+          ]
         },
         "actions": {
-          "actionGroups": ["[resourceId('microsoft.insights/actionGroups', concat('ag-soc-', parameters('env')))]"]
+          "actionGroups": [ "[variables('actionGroupId')]" ]
         }
       }
     }
-  ]
+  ],
+  "outputs": {
+    "actionGroupId": {
+      "type": "string",
+      "value": "[variables('actionGroupId')]"
+    }
+  }
 }

@@ -1,26 +1,80 @@
-version: "3.8"
-
-# Wazuh single-node stack for local development. Production deployment
-# (Azure VM/AKS) is provisioned via infra/modules/wazuh_compute instead —
-# see docs/deployment.md.
-
-x-wazuh-image-version: &wazuh-version "4.9.2"
+# =============================================================================
+# CORRECTED. Changes vs the committed version:
+#
+#  1. BLOCKER - scripts/generate_wazuh_certs.sh writes certs to
+#     docker/wazuh/config/wazuh_indexer_ssl_certs/ and NOTHING MOUNTED THEM.
+#     The indexer's security plugin cannot start without its certs, and the
+#     manager runs Filebeat with FILEBEAT_SSL_VERIFICATION_MODE=full against
+#     an indexer that has no TLS. `make wazuh-up` could not work. Cert
+#     mounts added to all three services.
+#
+#  2. BLOCKER - rules and decoders were mounted at
+#     /var/ossec/etc/rules/custom/ and /var/ossec/etc/decoders/custom/.
+#     Wazuh reads etc/rules/*.xml and etc/decoders/*.xml and does NOT
+#     recurse into subdirectories, so the custom rules were never loaded.
+#     Now mounted as files at the paths Wazuh actually reads.
+#
+#  3. The integration script needs root:wazuh 750 to execute. A read-only
+#     bind mount carries host ownership, so it is built into a derived image
+#     instead - see docker/wazuh-manager/Dockerfile in the note below.
+#
+#  4. Removed the obsolete `version:` key (warns on every Compose v2 call)
+#     and the x-wazuh-image-version anchor, which was defined and never
+#     referenced while both images hardcoded 4.9.2. Now a real anchor.
+#
+#  5. ml-inference: added the HF token and a model cache volume.
+#     mistralai/Mistral-7B-Instruct-v0.2 is a GATED model - it needs an
+#     accepted licence and a token, neither of which was documented, and
+#     without a cache volume the ~15GB of weights re-download on every
+#     container recreate.
+#
+#  6. Dashboard moved from host 443 to 8443. Binding 443 needs root on Linux
+#     and collides with anything else on the box.
+#
+#  7. Manager ports bound to 127.0.0.1 where they do not need to be reachable
+#     from the LAN. Change back deliberately when you onboard real agents.
+#
+# STILL A PROBLEM (report P3-5): ml-inference runs python:3.11-slim on CPU
+# and loads Mistral-7B in bfloat16 - roughly 15GB of RAM at about 1 token/s.
+# The documented local quickstart cannot run on a laptop. Either point
+# LLM_INFERENCE_URL at a remote endpoint for local dev, or swap this service
+# for Ollama with a quantised GGUF, which is what the article describes
+# anyway.
+# =============================================================================
 
 services:
   wazuh.manager:
-    image: wazuh/wazuh-manager:4.9.2
+    # NOTE: build, don't pull. The integration script must be root:wazuh 750,
+    # which a read-only bind mount cannot provide. Create
+    # docker/wazuh-manager/Dockerfile:
+    #
+    #   FROM wazuh/wazuh-manager:4.9.2
+    #   COPY wazuh/integrations/ml_pipeline_integration.py \
+    #        /var/ossec/integrations/custom-ml-pipeline
+    #   RUN chown root:wazuh /var/ossec/integrations/custom-ml-pipeline \
+    #    && chmod 750 /var/ossec/integrations/custom-ml-pipeline
+    #
+    # and remember the <integration> block in ossec.conf - see
+    # patches/ossec-conf-snippet.xml. Without it the script is never called.
+    build:
+      context: .
+      dockerfile: docker/wazuh-manager/Dockerfile
+    image: soc-ai/wazuh-manager:${WAZUH_VERSION:-4.9.2}
     hostname: wazuh.manager
     restart: unless-stopped
     ports:
-      - "1514:1514"       # agent event data
-      - "1515:1515"       # agent enrollment
-      - "514:514/udp"     # syslog
-      - "55000:55000"     # Wazuh API
+      - "1514:1514"
+      - "1515:1515"
+      - "127.0.0.1:514:514/udp"
+      - "127.0.0.1:55000:55000"
     environment:
       - INDEXER_URL=https://wazuh.indexer:9200
       - INDEXER_USERNAME=${WAZUH_INDEXER_USER:-admin}
-      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-change-me}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:?set WAZUH_INDEXER_PASSWORD in .env}
       - FILEBEAT_SSL_VERIFICATION_MODE=full
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
     volumes:
       - wazuh_api_configuration:/var/ossec/api/configuration
       - wazuh_etc:/var/ossec/etc
@@ -31,18 +85,22 @@ services:
       - wazuh_active_response:/var/ossec/active-response/bin
       - wazuh_agentless:/var/ossec/agentless
       - wazuh_wodles:/var/ossec/wodles
-      - ./wazuh/rules:/var/ossec/etc/rules/custom:ro
-      - ./wazuh/decoders:/var/ossec/etc/decoders/custom:ro
-      - ./wazuh/integrations/ml_pipeline_integration.py:/var/ossec/integrations/custom-ml-pipeline:ro
+      # FIXED: files, not a custom/ subdirectory Wazuh never reads.
+      - ./wazuh/rules/local_ml_rules.xml:/var/ossec/etc/rules/local_ml_rules.xml:ro
+      - ./wazuh/decoders/local_ml_decoders.xml:/var/ossec/etc/decoders/local_ml_decoders.xml:ro
+      # ADDED: the certs the compose file never mounted.
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem:/etc/ssl/root-ca.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.manager.pem:/etc/ssl/filebeat.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.manager-key.pem:/etc/ssl/filebeat.key:ro
     networks:
       - soc-net
 
   wazuh.indexer:
-    image: wazuh/wazuh-indexer:4.9.2
+    image: wazuh/wazuh-indexer:${WAZUH_VERSION:-4.9.2}
     hostname: wazuh.indexer
     restart: unless-stopped
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
     environment:
       - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
     ulimits:
@@ -54,21 +112,37 @@ services:
         hard: 65536
     volumes:
       - wazuh-indexer-data:/var/lib/wazuh-indexer
+      # ADDED: without these the security plugin refuses to start.
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.indexer-key.pem:/usr/share/wazuh-indexer/certs/wazuh.indexer.key:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.indexer.pem:/usr/share/wazuh-indexer/certs/wazuh.indexer.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/admin.pem:/usr/share/wazuh-indexer/certs/admin.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/admin-key.pem:/usr/share/wazuh-indexer/certs/admin-key.pem:ro
+      # These two config files are required by the upstream single-node
+      # compose and were absent from the repo. Copy them from
+      # wazuh/wazuh-docker at the matching tag.
+      - ./docker/wazuh/config/wazuh_indexer/wazuh.indexer.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ./docker/wazuh/config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/opensearch-security/internal_users.yml:ro
     networks:
       - soc-net
 
   wazuh.dashboard:
-    image: wazuh/wazuh-dashboard:4.9.2
+    image: wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.9.2}
     hostname: wazuh.dashboard
     restart: unless-stopped
     ports:
-      - "443:5601"
+      # FIXED: 443 needs root on Linux and collides with everything.
+      - "8443:5601"
     environment:
       - INDEXER_USERNAME=${WAZUH_INDEXER_USER:-admin}
-      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:-change-me}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD:?set WAZUH_INDEXER_PASSWORD in .env}
       - WAZUH_API_URL=https://wazuh.manager
       - DASHBOARD_USERNAME=${WAZUH_DASHBOARD_USER:-kibanaserver}
-      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD:-change-me}
+      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD:?set WAZUH_DASHBOARD_PASSWORD in .env}
+    volumes:
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/wazuh.dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem:ro
+      - ./docker/wazuh/config/wazuh_indexer_ssl_certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
     depends_on:
       - wazuh.indexer
       - wazuh.manager
@@ -82,10 +156,17 @@ services:
     hostname: ml-inference
     restart: unless-stopped
     env_file: .env
+    environment:
+      # ADDED: Mistral-7B-Instruct-v0.2 is gated. Without an accepted
+      # licence and a token this 401s, which was documented nowhere.
+      - HF_TOKEN=${HF_TOKEN:?accept the Mistral licence on HuggingFace and set HF_TOKEN}
+      - HF_HOME=/cache/huggingface
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     volumes:
       - ./ml/models:/app/ml/models:ro
+      # ADDED: without this, ~15GB of weights re-download on every recreate.
+      - hf-cache:/cache/huggingface
     networks:
       - soc-net
 
@@ -98,10 +179,18 @@ services:
     env_file: .env
     environment:
       - LLM_INFERENCE_URL=http://ml-inference:8001
+      # Local dev pepper for src/common/phi.py. In Azure this comes from
+      # Key Vault. Generate: openssl rand -hex 32
+      - PHI_PEPPER=${PHI_PEPPER:?generate with: openssl rand -hex 32}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       - ml-inference
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - soc-net
 
@@ -120,3 +209,4 @@ volumes:
   wazuh_agentless:
   wazuh_wodles:
   wazuh-indexer-data:
+  hf-cache:
