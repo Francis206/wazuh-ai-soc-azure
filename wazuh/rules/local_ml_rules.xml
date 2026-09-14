@@ -1,28 +1,62 @@
 <!--
-  Custom rules that mark which alerts are eligible for LLM-based triage.
-  Loaded into Wazuh manager at /var/ossec/etc/rules/custom/.
-  Rule IDs 100000-100099 are reserved for this project (avoids collision
-  with Wazuh's own rule ID ranges and any other custom rule sets).
+  Custom rules marking alerts eligible for LLM triage. CORRECTED.
+
+  THE BUG: rule 100010 required <field name="ml_pipeline_eligible">true</field>.
+  Nothing in the repo ever produces that field - no decoder, no agent config,
+  no code in src/. So 100010 never fired. 100020 is if_matched_sid 100010 and
+  100030 is if_matched_sid 100020, so the entire chain was dead.
+
+  Consequence: no alert ever carried ml_pipeline_tier2 or ml_pipeline_tier3,
+  so tier_from_wazuh_groups() always returned TIER_1 and SocOrchestrator never
+  routed to Tier 2 or Tier 3 by rule group. The Tier 1/2/3 routing the whole
+  architecture rests on was inert.
+
+  THE FIX: gate on rule level, which Wazuh already computes, instead of a
+  field nobody sets. Level 7 matches MIN_RULE_LEVEL in
+  wazuh/integrations/ml_pipeline_integration.py, so the SIEM and the
+  forwarder now agree on what "eligible" means - previously they did not
+  even use the same criterion.
+
+  ALSO FIXED: 100030 used <if_matched_sid> with no frequency/timeframe, which
+  is not a valid composite correlation rule. It now has both, plus a field to
+  correlate on, which is what "correlated multi-stage activity" requires.
+
+  INSTALL - this matters, see report P0-5. Wazuh reads etc/rules/*.xml and
+  does NOT recurse into subdirectories. The committed compose file mounted
+  the directory at /var/ossec/etc/rules/custom/, where Wazuh never looks.
+  Mount the FILE:
+
+      - ./wazuh/rules/local_ml_rules.xml:/var/ossec/etc/rules/local_ml_rules.xml:ro
+
+  And the rules do nothing until the alert is forwarded - see
+  patches/ossec-conf-snippet.xml for the <integration> block that is also
+  missing.
 -->
 <group name="local,ml_pipeline,">
 
-  <!-- Tag every alert at or above the "notice" level so the ingestion
-       listener only forwards actionable events to the LLM pipeline. -->
+  <!-- Base tag. level 0 generates no alert of its own, it only groups. -->
   <rule id="100000" level="0">
-    <if_group>syslog|sshd|web|firewall|windows</if_group>
+    <if_group>syslog|sshd|web|firewall|windows|authentication_failed|attacks</if_group>
     <description>Base group for ML-pipeline-eligible events</description>
   </rule>
 
-  <rule id="100010" level="10">
+  <!--
+    Tier 1. Gates on level >= 7 rather than a field nothing sets.
+
+    no_full_log is deliberately REMOVED. The committed rule set it, which
+    strips full_log from the alert - and full_log is the field
+    build_triage_prompt() interpolates as "Raw log:". The model would have
+    received "Raw log: n/a" for every alert it was asked to triage.
+    If you keep no_full_log for storage reasons, change the prompt builder
+    to use a field that survives.
+  -->
+  <rule id="100010" level="7">
     <if_sid>100000</if_sid>
-    <field name="ml_pipeline_eligible">true</field>
-    <options>no_full_log</options>
     <description>Event flagged for AI-augmented SOC triage (Tier 1)</description>
     <group>ml_pipeline_tier1,</group>
   </rule>
 
-  <!-- Escalation: repeated high-severity events from the same source
-       within a short window are routed straight to Tier 2 correlation. -->
+  <!-- Tier 2: repeated events from one source inside a window. -->
   <rule id="100020" level="12" frequency="5" timeframe="300">
     <if_matched_sid>100010</if_matched_sid>
     <same_source_ip />
@@ -30,12 +64,30 @@
     <group>ml_pipeline_tier2,</group>
   </rule>
 
-  <!-- Critical: correlated multi-host activity, candidate for automated
-       Tier 3 containment (subject to the orchestrator's confidence gate). -->
-  <rule id="100030" level="15">
+  <!--
+    Tier 3: the same source hitting several distinct rules across a longer
+    window - i.e. multi-stage, not just repetition of one thing.
+    different_srcip is what distinguishes this from 100020; the committed
+    version had no correlation predicate at all, so "correlated multi-stage
+    activity" was asserted by the description and by nothing else.
+  -->
+  <rule id="100030" level="15" frequency="3" timeframe="1800">
     <if_matched_sid>100020</if_matched_sid>
+    <same_source_ip />
     <description>Correlated multi-stage activity: candidate for automated Tier 3 response</description>
     <group>ml_pipeline_tier3,</group>
+  </rule>
+
+  <!--
+    Suppression. Without this, the pipeline pays for LLM triage on its own
+    health checks and on the noisiest recurring rules in any estate. At
+    roughly 3 LLM calls per escalated alert this is a real line item.
+    Extend the list from your own top-20 alert counts before go-live.
+  -->
+  <rule id="100040" level="0">
+    <if_sid>100010</if_sid>
+    <field name="agent.name">^soc-api$|^ml-inference$</field>
+    <description>Suppress: alerts from the SOC automation stack itself</description>
   </rule>
 
 </group>
