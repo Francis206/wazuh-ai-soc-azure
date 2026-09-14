@@ -1,0 +1,72 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # weekly Monday scan catches newly disclosed CVEs
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  python-sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Bandit
+        run: |
+          pip install bandit==1.7.9
+          bandit -r src -ll -f screen
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pip-audit
+        run: |
+          pip install pip-audit==2.7.3
+          pip-audit -r requirements.txt --skip-editable || true # advisory, non-blocking
+
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build API image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/api/Dockerfile
+          push: false
+          load: true
+          tags: soc-ai-api:scan
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: soc-ai-api:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+      - name: Upload Trivy results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  terraform-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: infra
+          framework: terraform
+          soft_fail: true

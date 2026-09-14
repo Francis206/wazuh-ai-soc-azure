@@ -1,0 +1,76 @@
+name: ML Fine-Tuning
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/llm/finetune/**"
+      - "ml/data/**"
+      - ".github/workflows/ml-training.yml"
+  workflow_dispatch:
+    inputs:
+      compute_target:
+        description: "Azure ML compute cluster to run on"
+        required: false
+        default: "gpu-cluster"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has_azure_creds: ${{ steps.check.outputs.has_azure_creds }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "${{ secrets.AZURE_CLIENT_ID }}" ] && [ -n "${{ secrets.AZURE_TENANT_ID }}" ] && [ -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
+            echo "has_azure_creds=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_azure_creds=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  submit-training-job:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_azure_creds == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Azure ML SDK
+        run: pip install azure-ai-ml==1.20.0 azure-identity==1.17.1 pyyaml==6.0.2
+
+      - name: Submit fine-tuning job to Azure ML
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          AZURE_ML_WORKSPACE: ${{ secrets.AZURE_ML_WORKSPACE }}
+        run: python scripts/submit_azureml_finetune_job.py --config src/llm/finetune/config.yaml
+
+      - name: Evaluate fine-tuned adapter
+        run: |
+          python -m src.llm.evaluation.evaluate \
+            --predictions ml/models/eval_predictions.jsonl \
+            --references ml/data/soc_incidents_eval.jsonl \
+            --output ml/models/eval_report.json
+        continue-on-error: true # populated once the Azure ML job downloads predictions locally; see docs/deployment.md
+
+  skip-notice:
+    needs: check-secrets
+    if: needs.check-secrets.outputs.has_azure_creds == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Skipping Azure ML fine-tuning job — Azure credentials not configured. See docs/deployment.md."
