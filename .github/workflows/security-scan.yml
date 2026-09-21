@@ -48,7 +48,7 @@ jobs:
           load: true
           tags: soc-ai-api:scan
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: soc-ai-api:scan
           format: sarif
